@@ -1,0 +1,38 @@
+{
+  "arch": "convnext_tiny",
+  "timm_name": "convnext_tiny.fb_in1k",
+  "size": 224,
+  "threshold": 0.4255558669567108,
+  "preprocessing": "exif_rgb_square_multicrop_bicubic_jpeg90_timm_normalize_v2",
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "num_classes": 1,
+  "num_members": 3,
+  "average": "logits",
+  "output": "logits",
+  "precision": "int8 weight-only (per-channel), float32 compute",
+  "selected": [
+    [
+      11,
+      0
+    ],
+    [
+      44,
+      2
+    ],
+    [
+      55,
+      3
+    ]
+  ],
+  "size_mb": 84.8,
+  "sha256": "4a6d4b0e22b51a923110ee16b17459d7d89ed7b212bbf10e6bf8715eefe46f06"
+}
