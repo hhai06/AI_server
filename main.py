@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ import numpy as np
 import onnxruntime as ort
 from botocore.config import Config
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 
@@ -32,10 +33,13 @@ MODEL_META_PATH = Path(os.getenv("AI_MODEL_META_PATH", str(ROOT / "forWeb_meta.j
 MODEL_VERSION = os.getenv("AI_MODEL_VERSION", "forWeb-onnx-v1")
 THREADS = int(os.getenv("AI_THREADS", "0")) or min(os.cpu_count() or 1, 4)
 MAX_PENDING = int(os.getenv("AI_MAX_PENDING", "20"))
+# Số view chạy mỗi lượt ONNX (chia nhỏ 6 view để giảm đỉnh RAM activation).
+BATCH_SIZE = max(1, int(os.getenv("AI_BATCH", "3")))
+# Tắt CPU arena + mem-pattern của ONNX Runtime để không giữ RAM thừa.
+LOW_MEMORY = os.getenv("AI_LOW_MEMORY", "true").lower() != "false"
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PIXELS = 40_000_000
-# Sáu view vuông được gộp thành duy nhất một ONNX batch:
-# toàn cảnh + bốn góc và trung tâm ở tỷ lệ 80%.
+
 CROP_SPECS = (
     (1.0, 0.5, 0.5),
     (0.8, 0.0, 0.0),
@@ -52,9 +56,9 @@ mean = np.zeros(3, np.float32)
 std = np.ones(3, np.float32)
 session: ort.InferenceSession | None = None
 input_name, output_name = "input", "output"
+fixed_batch: int | None = None
 ready = False
 load_error: str | None = None
-job_runner_lock = threading.Lock()
 accepted_jobs: set[str] = set()
 jobs_lock = threading.Lock()
 
@@ -74,9 +78,10 @@ class AnalysisJob(BaseModel):
     analysis_id: str
     case_id: str
     image_key: str = Field(min_length=1, max_length=500)
-    # JPG/JPEG uses image/jpeg; NestJS verifies magic bytes before upload.
     mime_type: str = Field(pattern=r"^image/(jpeg|png|webp)$")
     gradcam_key: str = Field(min_length=1, max_length=500)
+
+job_queue: queue.Queue[AnalysisJob | None] = queue.Queue(maxsize=MAX_PENDING)
 
 
 def configured_callback_url() -> str:
@@ -100,7 +105,7 @@ def validate_runtime_config() -> None:
 
 
 def load_model() -> None:
-    global input_name, output_name, input_size, mean, std, model_name, model_threshold, session
+    global input_name, output_name, input_size, mean, std, model_name, model_threshold, session, fixed_batch
     if not MODEL_PATH.is_file():
         raise RuntimeError(f"Không tìm thấy model ONNX: {MODEL_PATH}")
     if not MODEL_META_PATH.is_file():
@@ -113,14 +118,22 @@ def load_model() -> None:
     options = ort.SessionOptions()
     options.intra_op_num_threads, options.inter_op_num_threads = THREADS, 1
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    # Không để worker của ORT quay vòng (spin) ăn CPU khi quota container nhỏ.
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    if LOW_MEMORY:
+        options.enable_cpu_mem_arena = False
+        options.enable_mem_pattern = False
     loaded = ort.InferenceSession(str(MODEL_PATH), sess_options=options, providers=["CPUExecutionProvider"])
     inputs, outputs = loaded.get_inputs(), loaded.get_outputs()
     if len(inputs) != 1 or len(outputs) != 1 or inputs[0].shape[-3:] != [3, size, size]:
         raise RuntimeError("Model ONNX không có input [batch, 3, size, size] và một output")
+    batch_dim = inputs[0].shape[0]
+    fixed_batch = batch_dim if isinstance(batch_dim, int) and batch_dim > 0 else None
     session, input_name, output_name = loaded, inputs[0].name, outputs[0].name
     input_size, model_threshold, mean, std = size, threshold, input_mean, input_std
     model_name = f"{meta.get('arch', 'model')}-onnx"
-    LOGGER.info("Loaded %s, input=%s, threshold=%.4f, threads=%d", model_name, inputs[0].shape, model_threshold, THREADS)
+    LOGGER.info("Loaded %s, input=%s, threshold=%.4f, threads=%d, batch=%s, low_memory=%s",
+                model_name, inputs[0].shape, model_threshold, THREADS, fixed_batch or BATCH_SIZE, LOW_MEMORY)
 
 
 def make_crops(image: Image.Image) -> list[tuple[Image.Image, tuple[int, int, int, int]]]:
@@ -136,23 +149,40 @@ def make_crops(image: Image.Image) -> list[tuple[Image.Image, tuple[int, int, in
     return crops
 
 
-def preprocess(image: Image.Image) -> np.ndarray:
+def preprocess_into(image: Image.Image, dest: np.ndarray, scratch: np.ndarray) -> None:
+
     image = image.resize((input_size, input_size), Image.Resampling.BICUBIC)
-    # JPEG-90 round-trip is part of the exported model's documented preprocessing.
     out = io.BytesIO()
     image.save(out, format="JPEG", quality=90)
     out.seek(0)
     with Image.open(out) as decoded:
-        pixels = np.asarray(decoded.convert("RGB"), dtype=np.float32) / 255.0
-    return (pixels - mean) / std
+        pixels = np.asarray(decoded.convert("RGB"), dtype=np.uint8)
+    np.copyto(scratch, pixels)         
+    np.divide(scratch, 255.0, out=scratch)
+    np.subtract(scratch, mean, out=scratch)
+    np.divide(scratch, std, out=scratch)
+    dest[...] = scratch.transpose(2, 0, 1)
 
 
 def predict(image: Image.Image) -> tuple[float, dict[str, Any]]:
     if session is None:
         raise RuntimeError("Model chưa sẵn sàng")
     views = make_crops(image)
-    batch = np.stack([preprocess(crop) for crop, _ in views]).transpose(0, 3, 1, 2).astype(np.float32)
-    logits = np.asarray(session.run([output_name], {input_name: np.ascontiguousarray(batch)})[0]).reshape(-1)
+    batch = np.empty((len(views), 3, input_size, input_size), np.float32)
+    scratch = np.empty((input_size, input_size, 3), np.float32)
+    for index, (crop, _) in enumerate(views):
+        preprocess_into(crop, batch[index], scratch)
+
+    step = fixed_batch or BATCH_SIZE
+    parts = []
+    for start in range(0, len(batch), step):
+        chunk = batch[start:start + step]
+        real = len(chunk)
+        if fixed_batch and real < fixed_batch:
+            chunk = np.concatenate([chunk, np.repeat(chunk[-1:], fixed_batch - real, axis=0)])
+        output = session.run([output_name], {input_name: np.ascontiguousarray(chunk)})[0]
+        parts.append(np.asarray(output).reshape(-1)[:real])
+    logits = np.concatenate(parts)
     probabilities = 1.0 / (1.0 + np.exp(-logits))
     crops = sorted(
         ({"box": list(box), "probability": float(prob), "label": int(float(prob) >= model_threshold)}
@@ -172,27 +202,6 @@ def _load_in_background() -> None:
     except Exception as exc:  # noqa: BLE001
         load_error = str(exc)
         LOGGER.exception("Model load failed")
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    threading.Thread(target=_load_in_background, daemon=True).start()
-    yield
-
-
-app = FastAPI(title="NPC image analysis", version=MODEL_VERSION, lifespan=lifespan)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    if not ready:
-        raise HTTPException(status_code=503, detail=load_error or "Model đang được nạp")
-    return {"status": "ok", "model": model_name, "device": "cpu", "format": "onnx"}
-
-
-def verify_key(value: str | None) -> None:
-    if not service_key or value is None or not hmac.compare_digest(value.encode(), service_key):
-        raise HTTPException(status_code=401, detail="Không được phép")
 
 
 def read_image(key: str) -> Image.Image:
@@ -226,13 +235,11 @@ def process_job(job: AnalysisJob) -> None:
     started = time.perf_counter()
     try:
         LOGGER.info("Processing analysis %s for %s", job.analysis_id, job.image_key)
-        with job_runner_lock:
-            probability, details = predict(read_image(job.image_key))
+        probability, details = predict(read_image(job.image_key))
         payload: dict[str, Any] = {
             "analysis_id": job.analysis_id, "status": "completed", "model_name": model_name, "model_version": MODEL_VERSION,
             "predicted_label": "malignant" if probability >= model_threshold else "benign",
             "probabilities": {"malignant": probability, "benign": 1.0 - probability}, "risk_score": round(probability * 100, 4),
-            # ONNX export has no autograd graph; do not fabricate a Grad-CAM image.
             "raw_output": {"threshold": model_threshold, **details},
         }
         LOGGER.info("Analysis %s done in %.2fs", job.analysis_id, time.perf_counter() - started)
@@ -246,8 +253,39 @@ def process_job(job: AnalysisJob) -> None:
             accepted_jobs.discard(job.analysis_id)
 
 
+def inference_loop() -> None:
+    while True:
+        job = job_queue.get()
+        if job is None:
+            return
+        process_job(job)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    threading.Thread(target=_load_in_background, daemon=True).start()
+    threading.Thread(target=inference_loop, daemon=True).start()
+    yield
+    job_queue.put(None)
+
+
+app = FastAPI(title="NPC image analysis", version=MODEL_VERSION, lifespan=lifespan)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    if not ready:
+        raise HTTPException(status_code=503, detail=load_error or "Model đang được nạp")
+    return {"status": "ok", "model": model_name, "device": "cpu", "format": "onnx"}
+
+
+def verify_key(value: str | None) -> None:
+    if not service_key or value is None or not hmac.compare_digest(value.encode(), service_key):
+        raise HTTPException(status_code=401, detail="Không được phép")
+
+
 @app.post("/jobs", status_code=202)
-async def submit_job(job: AnalysisJob, background_tasks: BackgroundTasks, x_ai_key: str | None = Header(default=None)) -> dict[str, str]:
+async def submit_job(job: AnalysisJob, x_ai_key: str | None = Header(default=None)) -> dict[str, str]:
     verify_key(x_ai_key)
     if not ready:
         raise HTTPException(status_code=503, detail=load_error or "Model chưa sẵn sàng")
@@ -255,9 +293,10 @@ async def submit_job(job: AnalysisJob, background_tasks: BackgroundTasks, x_ai_k
         if job.analysis_id in accepted_jobs:
             LOGGER.info("Duplicate analysis accepted: %s", job.analysis_id)
             return {"status": "accepted", "analysis_id": job.analysis_id}
-        if len(accepted_jobs) >= MAX_PENDING:
-            raise HTTPException(status_code=429, detail="Hàng đợi đầy, thử lại sau")
+        try:
+            job_queue.put_nowait(job)
+        except queue.Full:
+            raise HTTPException(status_code=429, detail="Hàng đợi đầy, thử lại sau") from None
         accepted_jobs.add(job.analysis_id)
     LOGGER.info("Accepted analysis: %s", job.analysis_id)
-    background_tasks.add_task(process_job, job)
     return {"status": "accepted", "analysis_id": job.analysis_id}
