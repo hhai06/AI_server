@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import random
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -32,7 +33,11 @@ MODEL_PATH = Path(os.getenv("AI_MODEL_PATH", str(ROOT / "forWeb.onnx"))).expandu
 MODEL_META_PATH = Path(os.getenv("AI_MODEL_META_PATH", str(ROOT / "forWeb_meta.json"))).expanduser()
 MODEL_VERSION = os.getenv("AI_MODEL_VERSION", "forWeb-onnx-v1")
 THREADS = int(os.getenv("AI_THREADS", "0")) or min(os.cpu_count() or 1, 4)
-MAX_PENDING = int(os.getenv("AI_MAX_PENDING", "20"))
+MAX_PENDING = int(os.getenv("AI_MAX_PENDING", "10"))
+CALLBACK_TIMEOUT_S = max(1, int(os.getenv("AI_CALLBACK_TIMEOUT_MS", "10000"))) / 1000
+CALLBACK_ATTEMPTS = max(1, int(os.getenv("AI_CALLBACK_ATTEMPTS", "3")))
+CALLBACK_BACKOFF_S = max(0, int(os.getenv("AI_CALLBACK_BACKOFF_BASE_MS", "2000"))) / 1000
+RECENT_DONE_TTL_S = max(60, int(os.getenv("AI_RECENT_DONE_TTL_MS", "2700000"))) / 1000
 # Số view chạy mỗi lượt ONNX (chia nhỏ 6 view để giảm đỉnh RAM activation).
 BATCH_SIZE = max(1, int(os.getenv("AI_BATCH", "3")))
 # Tắt CPU arena + mem-pattern của ONNX Runtime để không giữ RAM thừa.
@@ -60,6 +65,7 @@ fixed_batch: int | None = None
 ready = False
 load_error: str | None = None
 accepted_jobs: set[str] = set()
+recently_done: dict[str, float] = {}
 jobs_lock = threading.Lock()
 
 s3 = boto3.client(
@@ -88,7 +94,8 @@ def configured_callback_url() -> str:
     parsed = urlparse(callback_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise RuntimeError("AI_CALLBACK_URL phải là URL HTTP(S) hợp lệ của NestJS")
-    return callback_url
+    # Route của Nest là /internal/ai/result; bỏ trailing slash để không phụ thuộc cấu hình strict routing.
+    return callback_url.rstrip("/")
 
 
 def validate_runtime_config() -> None:
@@ -219,15 +226,15 @@ def read_image(key: str) -> Image.Image:
 
 
 def send_callback(payload: dict[str, Any]) -> None:
-    with httpx.Client(timeout=20.0, headers={"X-AI-Key": callback_secret}) as client:
-        for attempt in range(3):
+    with httpx.Client(timeout=CALLBACK_TIMEOUT_S, headers={"X-AI-Key": callback_secret}) as client:
+        for attempt in range(CALLBACK_ATTEMPTS):
             try:
                 client.post(configured_callback_url(), json=payload).raise_for_status()
                 return
             except Exception:  # noqa: BLE001
                 LOGGER.warning("Callback attempt %d failed: %s", attempt + 1, payload.get("analysis_id"))
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < CALLBACK_ATTEMPTS - 1:
+                    time.sleep(random.random() * min(10.0, CALLBACK_BACKOFF_S * 2 ** attempt))
     LOGGER.error("Callback gave up: %s", payload.get("analysis_id"))
 
 
@@ -251,6 +258,8 @@ def process_job(job: AnalysisJob) -> None:
     finally:
         with jobs_lock:
             accepted_jobs.discard(job.analysis_id)
+            # Giữ dấu đã xử lý để bản gửi lại (sau callback rớt/restart) không chạy inference lại.
+            recently_done[job.analysis_id] = time.monotonic()
 
 
 def inference_loop() -> None:
@@ -276,7 +285,11 @@ app = FastAPI(title="NPC image analysis", version=MODEL_VERSION, lifespan=lifesp
 def health() -> dict[str, str]:
     if not ready:
         raise HTTPException(status_code=503, detail=load_error or "Model đang được nạp")
-    return {"status": "ok", "model": model_name, "device": "cpu", "format": "onnx"}
+    pending = job_queue.qsize()
+    if pending >= max(1, MAX_PENDING - 2):
+        # Báo quá tải sớm để Nest mở circuit trước khi phải trả 429.
+        raise HTTPException(status_code=503, detail=f"Hàng đợi AI đang đầy ({pending}/{MAX_PENDING})")
+    return {"status": "ok", "model": model_name, "device": "cpu", "format": "onnx", "pending": str(pending)}
 
 
 def verify_key(value: str | None) -> None:
@@ -290,7 +303,11 @@ async def submit_job(job: AnalysisJob, x_ai_key: str | None = Header(default=Non
     if not ready:
         raise HTTPException(status_code=503, detail=load_error or "Model chưa sẵn sàng")
     with jobs_lock:
-        if job.analysis_id in accepted_jobs:
+        now = time.monotonic()
+        stale = [key for key, done_at in recently_done.items() if now - done_at > RECENT_DONE_TTL_S]
+        for key in stale:
+            recently_done.pop(key, None)
+        if job.analysis_id in accepted_jobs or job.analysis_id in recently_done:
             LOGGER.info("Duplicate analysis accepted: %s", job.analysis_id)
             return {"status": "accepted", "analysis_id": job.analysis_id}
         try:
